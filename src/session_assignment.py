@@ -56,7 +56,7 @@ class Paper:
         return "P(title={})".format(self.title)
 
     def clusters(self):
-        return self.cluster09, self.cluster06, self.cluster12
+        return self.cluster06, self.cluster09, self.cluster12
 
 
 @dataclass()
@@ -196,28 +196,41 @@ class Assignment:
         for r in self.reservations:
             for i, s in enumerate(r.order):
                 self.session_and_order_to_reservation[s][i].append(r)
-        session_to_r_list: Dict[str, List[Reservation]] = self.assign_to_prefer_large_cluster()
+        self.session_to_r_list: Dict[str, List[Reservation]] = self.assign_to_prefer_large_cluster()
         self.id_to_session: Dict[int, str] = dict()
-        for s, r_list in session_to_r_list.items():
+        for s, r_list in self.session_to_r_list.items():
             for r in r_list:
                 self.id_to_session[r.paper_id] = s
 
     def dump(self, papers: List[Paper]):
+        num_clusters = self.reservations[0].len_clusters()
         with open(self.path_out, "w", newline="\n") as f:
-            fieldnames = list(asdict(papers[0])) + ["Session", "Reservations", "Selected-Rank"]
+            fieldnames = list(asdict(papers[0])) + ["Session", "Reservations", "Selected-Rank"] \
+                         + ["Friend-in-Session-{}".format(c) for c in range(num_clusters)]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
+            num_friend_dict = {}
             for paper in papers:
                 try:
                     session = self.id_to_session[paper.paper_id]
                     reservation = self.id_to_reservation[paper.paper_id].order
                     selected_rank = reservation.index(session)
+                    r_list = self.session_to_r_list[session]
+                    for c in range(num_clusters):
+                        num_friend_dict["Friend-in-Session-{}".format(c)] = round(
+                            len([r for r in r_list if r.clusters[c] == paper.clusters()[c]])
+                            / len(r_list),
+                            2,
+                        )
                 except KeyError:
                     session = False
                     reservation = []
                     selected_rank = None
+                    for c in range(num_clusters):
+                        num_friend_dict["Friend-in-Session-{}".format(c)] = "N/A"
                 writer.writerow({"Session": session, "Reservations": reservation,
                                  "Selected-Rank": selected_rank,
+                                 **num_friend_dict,
                                  **asdict(paper)})
             print("Dump: {}".format(self.path_out))
 
