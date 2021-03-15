@@ -81,9 +81,18 @@ class Reservation:
         return self.paper.paper_id
 
 
+def get_important_words(km, vectorizer, num_words) -> List[List[str]]:
+    centers = km.cluster_centers_
+    centers_idx = np.argsort(-centers, axis=1)[:, :num_words]
+    iw_array = np.asarray(vectorizer.get_feature_names())[centers_idx]
+    return iw_array.tolist()
+
+
 def get_papers(
         path_in="../data/ICLR_2021_paper_status.csv",
         path_out="../data/ICLR_2021_accepted_paper.csv",
+        path_center_words="../data/ICLR_2021_center_words.csv",
+        num_center_words=20,
         as_dict=True,
 ):
     try:
@@ -131,6 +140,14 @@ def get_papers(
                 if p.decision != "Reject":
                     writer.writerow(asdict(p))
             print("Dump: {}".format(path_out))
+        with open(path_center_words, "w", newline="\n") as f:
+            writer = csv.DictWriter(f, fieldnames=["n_clusters", "cluster_idx"] + list(range(num_center_words)))
+            writer.writeheader()
+            for km in [km06, km09, km12]:
+                for cluster_idx, word_list in enumerate(get_important_words(km, vectorizer, num_center_words)):
+                    writer.writerow({"n_clusters": km.n_clusters, "cluster_idx": cluster_idx,
+                                     **{i: w for i, w in enumerate(word_list)}})
+            print("Dump: {}".format(path_center_words))
         papers = [p for p in papers if p.decision != "Reject"]
 
     return papers if not as_dict else {p.paper_id: p for p in papers}
@@ -202,6 +219,7 @@ class Assignment:
                 writer.writerow({"Session": session, "Reservations": reservation,
                                  "Selected-Rank": selected_rank,
                                  **asdict(paper)})
+            print("Dump: {}".format(self.path_out))
 
     def sort_by_cluster_size(self, r_list: List[Reservation], decreasing=True):
         c0 = Counter([r.clusters[0] for r in r_list])
