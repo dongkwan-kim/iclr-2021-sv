@@ -187,17 +187,21 @@ class Assignment:
 
     def dump(self, papers: List[Paper]):
         with open(self.path_out, "w", newline="\n") as f:
-            fieldnames = list(asdict(papers[0])) + ["Session", "Reservations"]
+            fieldnames = list(asdict(papers[0])) + ["Session", "Reservations", "Selected-Rank"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for paper in papers:
                 try:
                     session = self.id_to_session[paper.paper_id]
                     reservation = self.id_to_reservation[paper.paper_id].order
+                    selected_rank = reservation.index(session)
                 except KeyError:
                     session = False
                     reservation = []
-                writer.writerow({"Session": session, "Reservations": reservation, **asdict(paper)})
+                    selected_rank = None
+                writer.writerow({"Session": session, "Reservations": reservation,
+                                 "Selected-Rank": selected_rank,
+                                 **asdict(paper)})
 
     def sort_by_cluster_size(self, r_list: List[Reservation], decreasing=True):
         c0 = Counter([r.clusters[0] for r in r_list])
