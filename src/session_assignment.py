@@ -3,7 +3,7 @@ from copy import deepcopy
 from pprint import pprint
 from typing import List, Tuple, Dict
 import csv
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -42,6 +42,10 @@ class Paper:
     cluster09: int = None
     cluster12: int = None
 
+    @property
+    def is_op_awarded(self):
+        return self.paper_id in [3177, 2114, 3496, 1820, 1018, 2561, 2508, 437]
+
     def typing(self):
         self.paper_id = int(self.paper_id)
         self.cluster06 = int(self.cluster06)
@@ -63,6 +67,10 @@ class Paper:
 class Reservation:
     paper: Paper
     order: list = None
+
+    @property
+    def is_op_awarded(self):
+        return self.paper.is_op_awarded
 
     def build_order(self, rows):
         sorted_rows = sorted(rows, key=lambda r: int(r["rank"]))
@@ -153,7 +161,7 @@ def get_papers(
     return papers if not as_dict else {p.paper_id: p for p in papers}
 
 
-def get_paper_session(path="../data/ICLR-2021-sessions.csv", id_to_paper=None):
+def get_paper_session(preference, exclude_op_papers, path="../data/ICLR-2021-sessions.csv", id_to_paper=None):
     id_and_type_to_rows = defaultdict(list)
     posters, spotlights, orals = [], [], []
     with open(path, "r", newline="\n") as f:
@@ -172,10 +180,17 @@ def get_paper_session(path="../data/ICLR-2021-sessions.csv", id_to_paper=None):
         else:
             raise ValueError
 
-    Assignment(orals + spotlights, path_out="../data/ICLR-2021-assignments-oral-{}.csv").dump(
+    op_postfix = "wo-op" if exclude_op_papers else "w-op"
+    Assignment([r for r in orals + spotlights if (not exclude_op_papers) or (not r.is_op_awarded)],
+               path_out="../data/ICLR-2021-assignments-oral-{}-{}.csv".format(preference, op_postfix),
+               preference=preference,
+               exclude_op_papers=exclude_op_papers).dump(
         [p for _, p in id_to_paper.items() if p.decision != "Poster"]
     )
-    Assignment(posters, path_out="../data/ICLR-2021-assignments-poster-{}.csv").dump(
+    Assignment(posters,
+               path_out="../data/ICLR-2021-assignments-poster-{}-{}.csv".format(preference, "w-op"),
+               preference=preference,
+               exclude_op_papers=False).dump(
         [p for _, p in id_to_paper.items()]
     )
 
@@ -186,13 +201,15 @@ class Assignment:
                  reservations: List[Reservation],
                  path_out: str,
                  max_size=None,
-                 preference="not_small_cluster"):
+                 preference="not_small_cluster",
+                 exclude_op_papers=False):
         self.reservations = reservations
-        self.id_to_reservation = {r.paper_id: r for r in self.reservations}
-        self.path_out = path_out.format(preference)
+        self.id_to_reservation: Dict[int, Reservation] = {r.paper_id: r for r in self.reservations}
+        self.path_out = path_out
         sess_counter = Counter(sum([r.order for r in reservations], []))
         paper_per_session = int(len(reservations) / len(sess_counter))
         self.max_size = max_size or paper_per_session
+        self.exclude_op_papers = exclude_op_papers
 
         self.session_and_order_to_reservation = defaultdict(lambda: defaultdict(list))
         for r in self.reservations:
@@ -208,6 +225,7 @@ class Assignment:
             raise ValueError
 
         self.id_to_session: Dict[int, str] = dict()
+
         for s, r_list in self.session_to_r_list.items():
             for r in r_list:
                 self.id_to_session[r.paper_id] = s
@@ -238,6 +256,8 @@ class Assignment:
                     selected_rank = None
                     for c in range(num_clusters):
                         num_friend_dict["Friend-in-Session-{}".format(c)] = "N/A"
+                if self.exclude_op_papers and paper.is_op_awarded:
+                    session = "OUTSTANDING"
                 writer.writerow({"Session": session, "Reservations": reservation,
                                  "Selected-Rank": selected_rank,
                                  **num_friend_dict,
@@ -278,6 +298,51 @@ class Assignment:
                 session_to_r_list[min_session].append(r)
                 is_r_assigned[r.paper_id] = True
         return is_r_assigned, session_to_r_list
+
+    def redistribute(self, session_to_r_list: Dict[str, List[Reservation]]):\
+
+        large_session_queue = [session for session, r_list in session_to_r_list.items()
+                               if len(r_list) > self.max_size]
+
+        def same_session_same_cluster(r, short_session, short_session_clusters):
+            return short_session in r.order and r.clusters[0] in short_session_clusters
+
+        def same_session(r, short_session, _):
+            return short_session in r.order
+
+        def _redistribute_from_larges(cond, max_iter=30):
+            i = 0
+            while len(large_session_queue) > 0:
+                large_session = large_session_queue.pop(0)
+                for short_session, short_r_list in sorted(session_to_r_list.items(), key=lambda t: len(t[1])):
+                    if len(short_r_list) < self.max_size:
+
+                        large_session_list = session_to_r_list[large_session]
+                        large_session_clusters = [r.clusters[0] for r in large_session_list]
+                        nam_session_to_abandon = len(large_session_clusters) - self.max_size
+
+                        short_session_clusters = [r.clusters[0] for r in short_r_list]
+                        legible_r_list = [r for r in large_session_list
+                                          if cond(r, short_session, short_session_clusters)][:1]
+                        legible_r_id_set = set([r.paper_id for r in legible_r_list])
+                        session_to_r_list[large_session] = [r for r in session_to_r_list[large_session]
+                                                            if r.paper_id not in legible_r_id_set]
+                        session_to_r_list[short_session] += legible_r_list
+
+                        if len(session_to_r_list[large_session]) > self.max_size:
+                            large_session_queue.append(large_session)
+
+                        if nam_session_to_abandon <= 0:
+                            break
+                if len(session_to_r_list[large_session]) > self.max_size:
+                    large_session_queue.append(large_session)
+                i += 1
+                if i > max_iter:
+                    break
+
+        _redistribute_from_larges(same_session_same_cluster, max_iter=30)
+        _redistribute_from_larges(same_session, max_iter=1)
+        return session_to_r_list
 
     def assign_to_prefer_not_small_cluster(self):
         session_to_r_list = defaultdict(list)
@@ -327,6 +392,7 @@ class Assignment:
                         break
 
         is_r_assigned, session_to_r_list = self.assign_reservation_wise(is_r_assigned, session_to_r_list)
+        session_to_r_list = self.redistribute(session_to_r_list)
 
         return session_to_r_list
 
@@ -368,9 +434,12 @@ class Assignment:
                     is_r_assigned[r.paper_id] = True
 
         is_r_assigned, session_to_r_list = self.assign_reservation_wise(is_r_assigned, session_to_r_list)
+        session_to_r_list = self.redistribute(session_to_r_list)
 
         return session_to_r_list
 
 
 if __name__ == '__main__':
-    get_paper_session(id_to_paper=get_papers())
+    EXCLUDE_OP_PAPERS = False
+    get_paper_session(preference="large_cluster", exclude_op_papers=EXCLUDE_OP_PAPERS, id_to_paper=get_papers())
+    get_paper_session(preference="not_small_cluster", exclude_op_papers=EXCLUDE_OP_PAPERS, id_to_paper=get_papers())
