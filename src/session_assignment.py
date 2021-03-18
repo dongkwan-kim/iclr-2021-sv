@@ -1,5 +1,6 @@
 from collections import defaultdict, Counter
 from copy import deepcopy
+from itertools import chain
 from pprint import pprint
 from typing import List, Tuple, Dict
 import csv
@@ -46,6 +47,10 @@ class Paper:
     def is_op_awarded(self):
         return self.paper_id in [3177, 2114, 3496, 1820, 1018, 2561, 2508, 437]
 
+    @property
+    def time(self):
+        return {"Oral": 15, "Spotlight": 10, "Poster": 5}[self.decision]
+
     def typing(self):
         self.paper_id = int(self.paper_id)
         self.cluster06 = int(self.cluster06)
@@ -67,10 +72,15 @@ class Paper:
 class Reservation:
     paper: Paper
     order: list = None
+    override_time: int = None
 
     @property
     def is_op_awarded(self):
         return self.paper.is_op_awarded
+
+    @property
+    def time(self):
+        return self.override_time or self.paper.time
 
     def build_order(self, rows):
         sorted_rows = sorted(rows, key=lambda r: int(r["rank"]))
@@ -161,7 +171,10 @@ def get_papers(
     return papers if not as_dict else {p.paper_id: p for p in papers}
 
 
-def get_paper_session(exclude_op_papers, path="../data/ICLR-2021-sessions.csv", id_to_paper=None):
+def get_paper_session(exclude_op_papers,
+                      qna_time_for_oral_session,
+                      path="../data/ICLR-2021-sessions.csv",
+                      id_to_paper=None):
     id_and_type_to_rows = defaultdict(list)
     posters, spotlights, orals = [], [], []
     with open(path, "r", newline="\n") as f:
@@ -183,11 +196,18 @@ def get_paper_session(exclude_op_papers, path="../data/ICLR-2021-sessions.csv", 
     op_postfix = "wo-op" if exclude_op_papers else "w-op"
     Assignment([r for r in orals + spotlights if (not exclude_op_papers) or (not r.is_op_awarded)],
                path_out="../data/ICLR-2021-assignments-oral-{}.csv".format(op_postfix),
+               max_time_per_session=3 * 60 - qna_time_for_oral_session,
+               consider_cluster_first=True,
                exclude_op_papers=exclude_op_papers).dump(
         [p for _, p in id_to_paper.items() if p.decision != "Poster"]
     )
+
+    for p in posters:
+        p.override_time = 5
     Assignment(posters,
                path_out="../data/ICLR-2021-assignments-poster-{}.csv".format("w-op"),
+               max_time_per_session=2 * 60,
+               consider_cluster_first=True,
                exclude_op_papers=False).dump(
         [p for _, p in id_to_paper.items()]
     )
@@ -198,15 +218,15 @@ class Assignment:
     def __init__(self,
                  reservations: List[Reservation],
                  path_out: str,
-                 max_size=None,
+                 max_time_per_session: int,
+                 consider_cluster_first: bool,
                  exclude_op_papers=False):
         self.reservations = reservations
         self.id_to_reservation: Dict[int, Reservation] = {r.paper_id: r for r in self.reservations}
 
         self.path_out = path_out
-        sess_counter = Counter(sum([r.order for r in reservations], []))
-        paper_per_session = int(len(reservations) / len(sess_counter))
-        self.max_size = max_size or paper_per_session
+        self.max_time_per_session = max_time_per_session
+        self.consider_cluster_first = consider_cluster_first
         self.exclude_op_papers = exclude_op_papers
 
         self.session_and_order_to_reservation = defaultdict(lambda: defaultdict(list))
@@ -216,8 +236,82 @@ class Assignment:
 
         self.session_to_r_list: Dict[str, List[Reservation]] = self.assign()
 
-    def assign(self) -> Dict[str, List[Reservation]]:
-        raise NotImplementedError
+    def assign(self, c_level=0) -> Dict[str, List[Reservation]]:
+        session_to_r_list: Dict[str, List[Reservation]] = defaultdict(list)
+
+        for r in self.reservations:
+
+            is_assigned = False
+
+            if self.consider_cluster_first:
+                order_generator = ((i, g) for i, gen in chain(enumerate([r.order, r.order])) for g in gen)
+            else:
+                order_generator = enumerate(r.order)
+
+            for i, o in order_generator:
+                _consider_cluster_here = self.consider_cluster_first and (i == 0)
+                is_assigned, session_to_r_list = self._assign(
+                    r, o, session_to_r_list, c_level, consider_cluster=_consider_cluster_here)
+                if is_assigned:
+                    break
+
+            if not is_assigned:
+                session_to_r_list = self._reallocate(r, session_to_r_list)
+
+        print("-" * 10)
+        for s, r_list in session_to_r_list.items():
+            print(s, len(r_list), self._time(s, session_to_r_list))
+        print("-" * 10)
+
+        return session_to_r_list
+
+    def _assign(self, r, o, session_to_r_list, c_level, consider_cluster):
+        _time_of_o = self._time(o, session_to_r_list)
+        _clusters_of_o = self._clusters(o, session_to_r_list, c_level)
+        is_time_good = _time_of_o + r.time <= self.max_time_per_session
+        is_cluster_good = r.clusters[c_level] in _clusters_of_o
+        is_assigned = is_time_good and (not consider_cluster or is_cluster_good)
+        if is_assigned:
+            session_to_r_list[o].append(r)
+        return is_assigned, session_to_r_list
+
+    def _time(self, session, session_to_r_list):
+        return sum([_r.time for _r in session_to_r_list[session]])
+
+    def _clusters(self, session, session_to_r_list, c=0):
+        counter = Counter([_r.clusters[c] for _r in session_to_r_list[session]])
+        return list(counter.keys())
+
+    def _reallocate(self, r_to_allocate: Reservation, session_to_r_list: Dict[str, List[Reservation]]):
+        is_assigned = False
+        min_triplet, min_time = None, 10000
+        for o in r_to_allocate.order:
+            r_list = session_to_r_list[o]
+            for r_allocated in r_list:
+                for o_candidate_to_move in r_allocated.order:
+
+                    _time_of_o_candidate = self._time(o_candidate_to_move, session_to_r_list)
+
+                    if min_time > _time_of_o_candidate:
+                        min_time = _time_of_o_candidate
+                        min_triplet = (o, r_allocated, o_candidate_to_move)
+
+                    if _time_of_o_candidate + r_allocated.time <= self.max_time_per_session:
+                        session_to_r_list[o_candidate_to_move].append(r_allocated)
+                        session_to_r_list[o] = [r for r in session_to_r_list[o] if r.paper_id != r_allocated.paper_id]
+                        session_to_r_list[o].append(r_to_allocate)
+                        is_assigned = True
+                        break
+                if is_assigned:
+                    break
+            if is_assigned:
+                break
+        if not is_assigned:
+            (o, r_allocated, o_candidate_to_move) = min_triplet
+            session_to_r_list[o] = [r for r in session_to_r_list[o] if r.paper_id != r_allocated.paper_id]
+            session_to_r_list[o].append(r_to_allocate)
+            session_to_r_list[o_candidate_to_move].append(r_allocated)
+        return session_to_r_list
 
     def dump(self, papers: List[Paper]):
         id_to_session: Dict[int, str] = {r.paper_id: s
@@ -272,5 +366,7 @@ class Assignment:
 
 
 if __name__ == '__main__':
-    EXCLUDE_OP_PAPERS = False
-    get_paper_session(exclude_op_papers=EXCLUDE_OP_PAPERS, id_to_paper=get_papers())
+    EXCLUDE_OP_PAPERS = True
+    get_paper_session(exclude_op_papers=EXCLUDE_OP_PAPERS,
+                      qna_time_for_oral_session=30,
+                      id_to_paper=get_papers())
