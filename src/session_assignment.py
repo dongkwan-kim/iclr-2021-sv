@@ -199,7 +199,8 @@ def get_paper_session(exclude_op_papers,
                max_time_per_session=3 * 60 - qna_time_for_oral_session,
                consider_cluster_first=True,
                exclude_op_papers=exclude_op_papers).dump(
-        [p for _, p in id_to_paper.items() if p.decision != "Poster"]
+        [p for _, p in id_to_paper.items() if p.decision != "Poster"],
+        assign_false_paper=False,  # we will assign false paper manually for oral session.
     )
 
     for p in posters:
@@ -209,7 +210,8 @@ def get_paper_session(exclude_op_papers,
                max_time_per_session=2 * 60,
                consider_cluster_first=True,
                exclude_op_papers=False).dump(
-        [p for _, p in id_to_paper.items()]
+        [p for _, p in id_to_paper.items()],
+        assign_false_paper=True,
     )
 
 
@@ -313,10 +315,31 @@ class Assignment:
             session_to_r_list[o_candidate_to_move].append(r_allocated)
         return session_to_r_list
 
-    def dump(self, papers: List[Paper]):
+    def dump(self, papers: List[Paper], assign_false_paper=True):
         id_to_session: Dict[int, str] = {r.paper_id: s
                                          for s, r_list in self.session_to_r_list.items()
                                          for r in r_list}
+        if assign_false_paper:
+            for paper in papers:
+                if paper.paper_id not in id_to_session and (not paper.is_op_awarded):
+                    _cluster = paper.clusters()[0]
+                    time_smallest_session = min(self._time(s, self.session_to_r_list) for s in self.session_to_r_list)
+                    smallest_session_to_clusters = {
+                        session: [r.clusters[0] for r in r_list]
+                        for session, r_list in self.session_to_r_list.items()
+                        if self._time(session, self.session_to_r_list) == time_smallest_session
+                    }
+                    smallest_session = None
+                    for smallest_session, clusters in smallest_session_to_clusters.items():
+                        if _cluster in clusters:
+                            self.session_to_r_list[smallest_session].append(Reservation(paper=paper))
+                            break
+                    else:
+                        self.session_to_r_list[smallest_session].append(Reservation(paper=paper))
+            id_to_session: Dict[int, str] = {r.paper_id: s
+                                             for s, r_list in self.session_to_r_list.items()
+                                             for r in r_list}
+
         num_clusters = self.reservations[0].len_clusters()
         with open(self.path_out, "w", newline="\n") as f:
             fieldnames = list(asdict(papers[0])) + ["Session", "Reservations", "Selected-Rank"] \
@@ -327,8 +350,6 @@ class Assignment:
             for paper in papers:
                 try:
                     session = id_to_session[paper.paper_id]
-                    reservation = self.id_to_reservation[paper.paper_id].order
-                    selected_rank = reservation.index(session)
                     r_list = self.session_to_r_list[session]
                     for c in range(num_clusters):
                         num_friend_dict["Friend-in-Session-{}".format(c)] = round(
@@ -338,10 +359,14 @@ class Assignment:
                         )
                 except KeyError:
                     session = False
-                    reservation = []
-                    selected_rank = None
                     for c in range(num_clusters):
                         num_friend_dict["Friend-in-Session-{}".format(c)] = "N/A"
+                try:
+                    reservation = self.id_to_reservation[paper.paper_id].order
+                    selected_rank = reservation.index(session)
+                except KeyError:
+                    reservation = []
+                    selected_rank = "N/A"
                 if self.exclude_op_papers and paper.is_op_awarded:
                     session = "OUTSTANDING"
                 writer.writerow({"Session": session, "Reservations": reservation,
