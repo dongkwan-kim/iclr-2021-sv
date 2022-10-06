@@ -17,7 +17,8 @@ CLIENT = openreview.Client(baseurl='https://api.openreview.net',
 
 
 def get_accepted_papers(
-        path_in="../data/ICLR_2021_paper_status.csv",
+        path_in="../data/NeurIPS_2022_paper_status.csv",
+        # path_in="../data/ICLR_2021_paper_status.csv",
 ):
     papers = []
     with open(path_in, "r", newline="\n") as f:
@@ -31,7 +32,7 @@ def get_accepted_papers(
                 elif "Oral" in row["decision"]:
                     decision = "Oral"
                 else:
-                    raise ValueError("Error: {}".format(row["decision"]))
+                    decision = row["decision"]
                 papers.append(dict(
                     paper_id=int(row["number"]),
                     title=row["title"],
@@ -40,6 +41,10 @@ def get_accepted_papers(
                 ))
             else:
                 decision = "Reject"
+    print("-" * 10)
+    print(f"len(papers) from csv: ", len(papers))
+    print(f"papers[0]: ", papers[0])
+    print("-" * 10)
     return papers
 
 
